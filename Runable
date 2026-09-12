@@ -1,0 +1,10 @@
+# pure LFU / base-level, NO similarity  -> does ACT-R beat this?
+!python actr_diagnostic_experiment.py --data-root /kaggle/working/data \
+  --output-dir /kaggle/working/abl_lfu --condition actr \
+  --seeds 5 --epochs 5 --quiet-diagnostics \
+  --actr-alpha 0 --actr-beta -1 --actr-gamma 0
+
+!python actr_diagnostic_experiment.py --data-root /kaggle/working/data \
+  --output-dir /kaggle/working/abl_roundrobin --condition shallow \
+  --seeds 5 --epochs 5 --quiet-diagnostics \
+  --floor-frac 1.0
