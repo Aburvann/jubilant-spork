@@ -1,0 +1,1625 @@
+%%writefile actr_diagnostic_experiment.py
+#!/usr/bin/env python3
+"""Kaggle-ready continual-learning experiment with retrieval diagnostics."""
+
+import importlib.util
+import subprocess
+import sys
+
+
+def install_missing_packages():
+    packages = {
+        "numpy": "numpy",
+        "torch": "torch",
+        "torchvision": "torchvision",
+    }
+    missing = [package for module, package in packages.items() if importlib.util.find_spec(module) is None]
+    if missing:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", *missing]
+        )
+
+
+install_missing_packages()
+
+import argparse
+import csv
+import json
+import math
+import os
+import random
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from torchvision import datasets, transforms
+
+
+@dataclass
+class ReplayEvent:
+    task: int
+    step: int
+    condition: str
+    memory_size: int
+    selected: int
+    query_selected_similarity: float
+    selected_pair_similarity: float
+    selected_class_entropy: float
+    selected_unique_classes: int
+    score_std: float
+    softmax_effective_fraction: float
+
+
+class TaskDataset(Dataset):
+    def __init__(self, base_dataset, indices: Sequence[int], transform):
+        self.base_dataset = base_dataset
+        self.indices = list(indices)
+        self.transform = transform
+        self.targets = [int(base_dataset.targets[i]) for i in self.indices]
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        image, label = self.base_dataset[self.indices[index]]
+        return self.transform(image), int(label)
+
+
+class SmallCifarCNN(nn.Module):
+    def __init__(self, num_classes: int):
+        super().__init__()
+        self.block1 = nn.Sequential(
+            nn.Conv2d(3, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+        )
+        self.block2 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+        )
+        self.block3 = nn.Sequential(
+            nn.Conv2d(128, 256, 3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.projector = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(256, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+        )
+        self.classifier = nn.Linear(256, num_classes)
+
+    def forward(self, x, return_features: bool = False):
+        shallow_map = self.block1(x)
+        shallow = F.adaptive_avg_pool2d(shallow_map, 1).flatten(1)
+        semantic = self.projector(self.block3(self.block2(shallow_map)))
+        logits = self.classifier(semantic)
+        if return_features:
+            return logits, shallow, semantic
+        return logits
+
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes: int, planes: int, stride: int = 1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            in_planes, planes, 3, stride=stride, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, 3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, planes, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes),
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)), inplace=True)
+        out = self.bn2(self.conv2(out))
+        out = out + self.shortcut(x)
+        return F.relu(out, inplace=True)
+
+
+class CifarResNet18(nn.Module):
+    """ResNet-18 with a 3x3 stem and no max-pool, the standard CIFAR variant."""
+
+    def __init__(self, num_classes: int):
+        super().__init__()
+        self.in_planes = 64
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 64, 3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        self.layer1 = self._make_layer(64, 2, 1)
+        self.layer2 = self._make_layer(128, 2, 2)
+        self.layer3 = self._make_layer(256, 2, 2)
+        self.layer4 = self._make_layer(512, 2, 2)
+        self.classifier = nn.Linear(512, num_classes)
+
+    def _make_layer(self, planes: int, blocks: int, stride: int):
+        layers = []
+        for current_stride in [stride] + [1] * (blocks - 1):
+            layers.append(BasicBlock(self.in_planes, planes, current_stride))
+            self.in_planes = planes
+        return nn.Sequential(*layers)
+
+    def forward(self, x, return_features: bool = False):
+        # shallow == after layer1 (early perceptual), semantic == penultimate,
+        # matching the two retrieval representations used by SmallCifarCNN.
+        shallow_map = self.layer1(self.stem(x))
+        shallow = F.adaptive_avg_pool2d(shallow_map, 1).flatten(1)
+        deep = self.layer4(self.layer3(self.layer2(shallow_map)))
+        semantic = F.adaptive_avg_pool2d(deep, 1).flatten(1)
+        logits = self.classifier(semantic)
+        if return_features:
+            return logits, shallow, semantic
+        return logits
+
+
+def build_model(arch: str, num_classes: int) -> nn.Module:
+    if arch == "resnet18":
+        return CifarResNet18(num_classes)
+    return SmallCifarCNN(num_classes)
+
+
+def normalized_entropy(counts: Sequence[int]) -> float:
+    values = np.asarray(counts, dtype=np.float64)
+    values = values[values > 0]
+    if len(values) <= 1:
+        return 0.0
+    probabilities = values / values.sum()
+    return float(-(probabilities * np.log(probabilities)).sum() / np.log(len(values)))
+
+
+def gini(values: Sequence[float]) -> float:
+    array = np.asarray(values, dtype=np.float64)
+    if array.size == 0 or np.allclose(array.sum(), 0.0):
+        return 0.0
+    array = np.sort(np.maximum(array, 0.0))
+    index = np.arange(1, len(array) + 1)
+    return float(
+        (2.0 * np.sum(index * array) / (len(array) * array.sum()))
+        - (len(array) + 1.0) / len(array)
+    )
+
+
+def distribution_jsd(left: Sequence[float], right: Sequence[float]) -> float:
+    p = np.asarray(left, dtype=np.float64)
+    q = np.asarray(right, dtype=np.float64)
+    if p.sum() == 0 or q.sum() == 0:
+        return 0.0
+    p /= p.sum()
+    q /= q.sum()
+    middle = 0.5 * (p + q)
+
+    def kl_divergence(a, b):
+        mask = a > 0
+        return float(np.sum(a[mask] * np.log2(a[mask] / b[mask])))
+
+    return 0.5 * kl_divergence(p, middle) + 0.5 * kl_divergence(q, middle)
+
+
+class ReplayMemory:
+    def __init__(
+        self,
+        per_class_capacity: int,
+        temperature: float,
+        floor_frac: float,
+        seed: int,
+        feature_transform: str = "standardize",
+        score_normalization: str = "zscore",
+        actr_feature: str = "shallow",
+        actr_alpha: float = 1.0,
+        actr_beta: float = -1.0,
+        actr_gamma: float = 1.0,
+        actr_decay: float = 0.5,
+        actr_noise: float = 0.0,
+        max_per_class: int = 0,
+    ):
+        self.per_class_capacity = per_class_capacity
+        self.temperature = temperature
+        self.floor_frac = floor_frac
+        self.feature_transform = feature_transform
+        self.score_normalization = score_normalization
+        self.actr_feature = actr_feature
+        self.actr_alpha = actr_alpha
+        self.actr_beta = actr_beta
+        self.actr_gamma = actr_gamma
+        self.actr_decay = actr_decay
+        self.actr_noise = actr_noise
+        self.max_per_class = max_per_class
+        self.generator = torch.Generator().manual_seed(seed)
+        self.images: List[torch.Tensor] = []
+        self.labels: List[int] = []
+        self.task_ids: List[int] = []
+        self.sample_ids: List[str] = []
+        self.retrieval_counts: List[int] = []
+        self.expected_retrievals: List[float] = []
+        self.last_retrieved_step: List[int] = []
+        self.creation_step: List[int] = []
+        self.class_retrieval_counts: Counter = Counter()
+        self.shallow_features: Optional[torch.Tensor] = None
+        self.semantic_features: Optional[torch.Tensor] = None
+        self.shallow_stats: Optional[Dict[str, torch.Tensor]] = None
+        self.semantic_stats: Optional[Dict[str, torch.Tensor]] = None
+        self.raw_shallow_cosine_mean = float("nan")
+        self.raw_semantic_cosine_mean = float("nan")
+        self.transformed_shallow_cosine_mean = float("nan")
+        self.transformed_semantic_cosine_mean = float("nan")
+        self.events: List[ReplayEvent] = []
+        self.gradient_cosines: List[float] = []
+        self.gradient_current_norms: List[float] = []
+        self.gradient_replay_norms: List[float] = []
+
+    def __len__(self):
+        return len(self.labels)
+
+    def add_task_data(self, dataset: TaskDataset, task_id: int, current_step: int = 0):
+        class_to_local_indices = defaultdict(list)
+        for local_index, label in enumerate(dataset.targets):
+            class_to_local_indices[label].append(local_index)
+
+        for label in sorted(class_to_local_indices):
+            candidates = class_to_local_indices[label]
+            permutation = torch.randperm(len(candidates), generator=self.generator).tolist()
+            chosen = [candidates[i] for i in permutation[: self.per_class_capacity]]
+            for local_index in chosen:
+                image, item_label = dataset[local_index]
+                source_index = dataset.indices[local_index]
+                self.images.append(image.cpu())
+                self.labels.append(item_label)
+                self.task_ids.append(task_id)
+                self.sample_ids.append(f"task{task_id}:source{source_index}")
+                self.retrieval_counts.append(0)
+                self.expected_retrievals.append(0.0)
+                self.last_retrieved_step.append(-1)
+                self.creation_step.append(current_step)
+
+        self.shallow_features = None
+        self.semantic_features = None
+        self.shallow_stats = None
+        self.semantic_stats = None
+
+    def _fit_transform_stats(self, raw: torch.Tensor) -> Dict[str, torch.Tensor]:
+        mean = raw.mean(dim=0, keepdim=True)
+        std = raw.std(dim=0, keepdim=True).clamp_min(1e-6)
+        return {"mean": mean, "std": std}
+
+    def _apply_transform(
+        self, raw: torch.Tensor, stats: Optional[Dict[str, torch.Tensor]]
+    ) -> torch.Tensor:
+        if self.feature_transform != "none" and stats is not None:
+            raw = raw - stats["mean"]
+            if self.feature_transform == "standardize":
+                raw = raw / stats["std"]
+        return F.normalize(raw, dim=1)
+
+    @torch.no_grad()
+    def refresh_features(self, model: nn.Module, device: torch.device, batch_size: int = 256):
+        if not self.images:
+            return
+        was_training = model.training
+        model.eval()
+        shallow_parts = []
+        semantic_parts = []
+        for start in range(0, len(self.images), batch_size):
+            batch = torch.stack(self.images[start : start + batch_size]).to(device)
+            _, shallow, semantic = model(batch, return_features=True)
+            shallow_parts.append(shallow.cpu())
+            semantic_parts.append(semantic.cpu())
+        raw_shallow = torch.cat(shallow_parts)
+        raw_semantic = torch.cat(semantic_parts)
+
+        # Post-ReLU pooled activations are non-negative, so raw cosine similarity
+        # saturates near 1 and carries almost no ranking signal. Centering (and
+        # optionally scaling) restores usable geometry before normalization.
+        self.shallow_stats = self._fit_transform_stats(raw_shallow)
+        self.semantic_stats = self._fit_transform_stats(raw_semantic)
+        self.raw_shallow_cosine_mean = float(
+            self._mean_pairwise_cosine(F.normalize(raw_shallow, dim=1))
+        )
+        self.raw_semantic_cosine_mean = float(
+            self._mean_pairwise_cosine(F.normalize(raw_semantic, dim=1))
+        )
+        self.shallow_features = self._apply_transform(raw_shallow, self.shallow_stats)
+        self.semantic_features = self._apply_transform(raw_semantic, self.semantic_stats)
+        self.transformed_shallow_cosine_mean = float(
+            self._mean_pairwise_cosine(self.shallow_features)
+        )
+        self.transformed_semantic_cosine_mean = float(
+            self._mean_pairwise_cosine(self.semantic_features)
+        )
+        model.train(was_training)
+
+    @staticmethod
+    def _mean_pairwise_cosine(features: torch.Tensor, sample_limit: int = 512) -> float:
+        if len(features) < 2:
+            return float("nan")
+        # Memory is stored in task order, so an evenly spaced stride keeps the
+        # estimate representative instead of biasing it toward the earliest task.
+        if len(features) > sample_limit:
+            positions = torch.linspace(0, len(features) - 1, sample_limit).long()
+            subset = features[positions]
+        else:
+            subset = features
+        matrix = subset @ subset.T
+        upper = torch.triu_indices(len(subset), len(subset), offset=1)
+        return float(matrix[upper[0], upper[1]].mean())
+
+    def _update_expected_counts(self, replay_size: int):
+        if not self.labels:
+            return
+        probability = min(replay_size, len(self.labels)) / len(self.labels)
+        for index in range(len(self.labels)):
+            self.expected_retrievals[index] += probability
+
+    def _coverage_floor_indices(self, count: int) -> List[int]:
+        if count <= 0:
+            return []
+        by_class = defaultdict(list)
+        for index, label in enumerate(self.labels):
+            by_class[label].append(index)
+        classes = sorted(by_class)
+        class_order = torch.randperm(len(classes), generator=self.generator).tolist()
+        selected = []
+        cursor = 0
+        while len(selected) < count:
+            label = classes[class_order[cursor % len(classes)]]
+            candidates = by_class[label]
+            chosen = candidates[
+                torch.randint(len(candidates), (1,), generator=self.generator).item()
+            ]
+            if chosen not in selected:
+                selected.append(chosen)
+            cursor += 1
+            if cursor > count * len(classes) * 4:
+                break
+        return selected
+
+    def _random_indices(self, replay_size: int) -> List[int]:
+        count = min(replay_size, len(self.labels))
+        return torch.randperm(len(self.labels), generator=self.generator)[:count].tolist()
+
+    def _base_level_activation(self, global_step: int) -> torch.Tensor:
+        # ACT-R optimized-learning approximation:
+        #   B_i = ln(n_i / (1 - d)) - d * ln(T_i)
+        # n_i counts the encoding event plus every retrieval; T_i is the age of
+        # the trace. High B_i means the item is already highly accessible.
+        counts = torch.tensor(self.retrieval_counts, dtype=torch.float32) + 1.0
+        age = (
+            torch.full((len(self.labels),), float(global_step))
+            - torch.tensor(self.creation_step, dtype=torch.float32)
+        ).clamp_min(1.0)
+        return torch.log(counts / (1.0 - self.actr_decay)) - self.actr_decay * torch.log(age)
+
+    def _class_overrepresentation(self) -> torch.Tensor:
+        # How much each item's class has been replayed relative to a uniform
+        # share, expressed per item so it can be combined with the other terms.
+        labels = torch.tensor(self.labels, dtype=torch.long)
+        total = float(sum(self.class_retrieval_counts.values()))
+        distinct = len(set(self.labels))
+        if total <= 0 or distinct == 0:
+            return torch.zeros(len(self.labels), dtype=torch.float32)
+        uniform_share = total / distinct
+        per_class = torch.tensor(
+            [self.class_retrieval_counts.get(int(label), 0) for label in labels],
+            dtype=torch.float32,
+        )
+        return per_class / uniform_share
+
+    @staticmethod
+    def _zscore(values: torch.Tensor) -> torch.Tensor:
+        return (values - values.mean()) / values.std().clamp_min(1e-6)
+
+    def _sample_with_class_cap(
+        self,
+        available_scores: torch.Tensor,
+        available_indices: torch.Tensor,
+        remaining: int,
+    ) -> List[int]:
+        # Draw items one at a time and retire a class once it reaches the cap.
+        # This raises per-batch class diversity without discarding the ranking,
+        # so cue relevance still decides which item represents each class.
+        available_labels = torch.tensor(
+            [self.labels[int(index)] for index in available_indices], dtype=torch.long
+        )
+        active = torch.ones(len(available_indices), dtype=torch.bool)
+        class_counts = Counter()
+        chosen: List[int] = []
+        for _ in range(remaining):
+            if not bool(active.any()):
+                break
+            masked = available_scores.masked_fill(~active, float("-inf"))
+            probabilities = torch.softmax(masked / max(self.temperature, 1e-8), dim=0)
+            # A sharply peaked softmax can underflow to all-zero in float32,
+            # which makes multinomial raise. Keep active candidates sampleable.
+            probabilities = torch.where(
+                active,
+                probabilities.clamp_min(1e-12),
+                torch.zeros_like(probabilities),
+            )
+            position = int(
+                torch.multinomial(probabilities, 1, generator=self.generator).item()
+            )
+            chosen.append(int(available_indices[position]))
+            active[position] = False
+            label = int(available_labels[position])
+            class_counts[label] += 1
+            if class_counts[label] >= self.max_per_class:
+                active &= available_labels != label
+        return chosen
+
+    @torch.no_grad()
+    def select(
+        self,
+        condition: str,
+        query_images: torch.Tensor,
+        model: nn.Module,
+        replay_size: int,
+        device: torch.device,
+        task_id: int,
+        global_step: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        count = min(replay_size, len(self.labels))
+        if count == 0:
+            raise RuntimeError("Replay selection requested from an empty memory.")
+
+        self._update_expected_counts(count)
+        query_selected_similarity = float("nan")
+        score_std = float("nan")
+        softmax_effective_fraction = float("nan")
+
+        if condition == "random":
+            selected = self._random_indices(count)
+            diagnostic_features = self.semantic_features
+        else:
+            if condition == "shallow":
+                feature_name = "shallow"
+            elif condition == "semantic":
+                feature_name = "semantic"
+            else:
+                feature_name = self.actr_feature
+            features = (
+                self.shallow_features if feature_name == "shallow" else self.semantic_features
+            )
+            stats = (
+                self.shallow_stats if feature_name == "shallow" else self.semantic_stats
+            )
+            if features is None:
+                raise RuntimeError("Memory features must be refreshed before similarity replay.")
+
+            was_training = model.training
+            model.eval()
+            _, query_shallow, query_semantic = model(
+                query_images.to(device), return_features=True
+            )
+            model.train(was_training)
+            query_raw = (query_shallow if feature_name == "shallow" else query_semantic).cpu()
+            query_features = self._apply_transform(query_raw, stats)
+
+            # Max-over-query implements cue-driven retrieval without collapsing
+            # a heterogeneous current batch into a potentially meaningless centroid.
+            similarities = query_features @ features.T
+            scores = similarities.max(dim=0).values
+
+            if condition == "actr":
+                # Cue relevance alone concentrates replay on a small subset. The
+                # base-level and overrepresentation terms restore coverage by
+                # discounting traces that are already accessible or already
+                # over-replayed at the class level.
+                scores = (
+                    self.actr_alpha * self._zscore(scores)
+                    + self.actr_beta * self._zscore(self._base_level_activation(global_step))
+                    - self.actr_gamma * self._zscore(self._class_overrepresentation())
+                )
+                if self.actr_noise > 0:
+                    uniform = torch.rand(
+                        len(scores), generator=self.generator, dtype=torch.float32
+                    ).clamp(1e-6, 1 - 1e-6)
+                    scores = scores + self.actr_noise * torch.log(uniform / (1 - uniform))
+
+            score_std = float(scores.std())
+            floor_count = min(count, int(round(count * self.floor_frac)))
+            floor_indices = self._coverage_floor_indices(floor_count)
+            available_mask = torch.ones(len(self.labels), dtype=torch.bool)
+            if floor_indices:
+                available_mask[floor_indices] = False
+            remaining = count - len(floor_indices)
+            available_indices = torch.where(available_mask)[0]
+            if remaining:
+                available_scores = scores[available_indices]
+                # Absolute cosine ranges differ wildly between representations, so a
+                # fixed temperature is not comparable across conditions. Z-scoring
+                # makes the temperature control selectivity, not feature scale.
+                if self.score_normalization == "zscore":
+                    available_scores = (
+                        available_scores - available_scores.mean()
+                    ) / available_scores.std().clamp_min(1e-6)
+                probabilities = torch.softmax(
+                    available_scores / max(self.temperature, 1e-8), dim=0
+                )
+                softmax_effective_fraction = float(
+                    torch.exp(
+                        -(probabilities * torch.log(probabilities.clamp_min(1e-12))).sum()
+                    )
+                    / len(probabilities)
+                )
+                if self.max_per_class > 0:
+                    similarity_indices = self._sample_with_class_cap(
+                        available_scores, available_indices, remaining
+                    )
+                else:
+                    sampled_positions = torch.multinomial(
+                        probabilities.clamp_min(1e-12),
+                        remaining,
+                        replacement=False,
+                        generator=self.generator,
+                    )
+                    similarity_indices = available_indices[sampled_positions].tolist()
+            else:
+                similarity_indices = []
+            selected = floor_indices + similarity_indices
+            query_selected_similarity = float(similarities[:, selected].max(dim=0).values.mean())
+            diagnostic_features = features
+
+        for index in selected:
+            self.retrieval_counts[index] += 1
+            self.last_retrieved_step[index] = global_step
+            self.class_retrieval_counts[self.labels[index]] += 1
+
+        selected_labels = [self.labels[index] for index in selected]
+        label_counts = Counter(selected_labels)
+        pair_similarity = float("nan")
+        if diagnostic_features is not None and len(selected) > 1:
+            chosen_features = F.normalize(diagnostic_features[selected], dim=1)
+            similarity_matrix = chosen_features @ chosen_features.T
+            upper = torch.triu_indices(len(selected), len(selected), offset=1)
+            pair_similarity = float(similarity_matrix[upper[0], upper[1]].mean())
+
+        self.events.append(
+            ReplayEvent(
+                task=task_id,
+                step=global_step,
+                condition=condition,
+                memory_size=len(self.labels),
+                selected=len(selected),
+                query_selected_similarity=query_selected_similarity,
+                selected_pair_similarity=pair_similarity,
+                selected_class_entropy=normalized_entropy(list(label_counts.values())),
+                selected_unique_classes=len(label_counts),
+                score_std=score_std,
+                softmax_effective_fraction=softmax_effective_fraction,
+            )
+        )
+        images = torch.stack([self.images[index] for index in selected]).to(device)
+        labels = torch.tensor(
+            [self.labels[index] for index in selected], dtype=torch.long, device=device
+        )
+        return images, labels
+
+    def record_gradient_diagnostics(
+        self,
+        current_loss: torch.Tensor,
+        replay_loss: torch.Tensor,
+        model: nn.Module,
+    ):
+        parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        current_gradients = torch.autograd.grad(
+            current_loss, parameters, retain_graph=True, allow_unused=True
+        )
+        replay_gradients = torch.autograd.grad(
+            replay_loss, parameters, retain_graph=True, allow_unused=True
+        )
+        current_parts = []
+        replay_parts = []
+        for current, replay, parameter in zip(
+            current_gradients, replay_gradients, parameters
+        ):
+            current_parts.append(
+                current.detach().flatten()
+                if current is not None
+                else torch.zeros_like(parameter).flatten()
+            )
+            replay_parts.append(
+                replay.detach().flatten()
+                if replay is not None
+                else torch.zeros_like(parameter).flatten()
+            )
+        current_vector = torch.cat(current_parts)
+        replay_vector = torch.cat(replay_parts)
+        current_norm = current_vector.norm()
+        replay_norm = replay_vector.norm()
+        cosine = F.cosine_similarity(current_vector, replay_vector, dim=0)
+        self.gradient_cosines.append(float(cosine))
+        self.gradient_current_norms.append(float(current_norm))
+        self.gradient_replay_norms.append(float(replay_norm))
+
+    def diagnostics(self, eligible_classes: Sequence[int]) -> Dict:
+        eligible = set(eligible_classes)
+        observed_by_class = Counter()
+        expected_by_class = defaultdict(float)
+        item_counts = []
+        retrieved_items = 0
+        eligible_items = 0
+        task_counts = Counter()
+
+        for index, label in enumerate(self.labels):
+            if label not in eligible:
+                continue
+            observed = self.retrieval_counts[index]
+            observed_by_class[label] += observed
+            expected_by_class[label] += self.expected_retrievals[index]
+            item_counts.append(observed)
+            eligible_items += 1
+            retrieved_items += int(observed > 0)
+            task_counts[self.task_ids[index]] += observed
+
+        classes = sorted(eligible)
+        observed = np.asarray([observed_by_class[c] for c in classes], dtype=np.float64)
+        expected = np.asarray([expected_by_class[c] for c in classes], dtype=np.float64)
+        ratio = np.divide(
+            observed,
+            expected,
+            out=np.zeros_like(observed),
+            where=expected > 0,
+        )
+        nonzero_expected = expected > 0
+        zero_classes = [
+            class_id
+            for class_id, obs, exp in zip(classes, observed, expected)
+            if exp > 0 and obs == 0
+        ]
+        ranked_classes = sorted(
+            ((class_id, int(observed_by_class[class_id])) for class_id in classes),
+            key=lambda item: (item[1], item[0]),
+        )
+        event_values = {
+            field: [
+                getattr(event, field)
+                for event in self.events
+                if not math.isnan(getattr(event, field))
+            ]
+            for field in (
+                "query_selected_similarity",
+                "selected_pair_similarity",
+                "selected_class_entropy",
+                "selected_unique_classes",
+                "score_std",
+                "softmax_effective_fraction",
+            )
+        }
+
+        def mean_or_nan(values):
+            return float(np.mean(values)) if values else float("nan")
+
+        return {
+            "eligible_classes": classes,
+            "zero_retrieval_classes": zero_classes,
+            "zero_retrieval_class_count": len(zero_classes),
+            "least_retrieved_classes": [
+                {"class": class_id, "count": count}
+                for class_id, count in ranked_classes[:10]
+            ],
+            "most_retrieved_classes": [
+                {"class": class_id, "count": count}
+                for class_id, count in reversed(ranked_classes[-10:])
+            ],
+            "class_retrieval_counts": {
+                str(class_id): int(observed_by_class[class_id]) for class_id in classes
+            },
+            "class_expected_uniform_counts": {
+                str(class_id): round(float(expected_by_class[class_id]), 4)
+                for class_id in classes
+            },
+            "class_observed_expected_ratio": {
+                str(class_id): round(float(value), 4)
+                for class_id, value in zip(classes, ratio)
+            },
+            "retrieval_count_mean": float(observed.mean()) if len(observed) else 0.0,
+            "retrieval_count_std": float(observed.std()) if len(observed) else 0.0,
+            "retrieval_count_cv": float(observed.std() / observed.mean())
+            if len(observed) and observed.mean() > 0
+            else 0.0,
+            "retrieval_count_gini": gini(observed),
+            "exposure_normalized_ratio_cv": float(ratio[nonzero_expected].std())
+            if nonzero_expected.any()
+            else 0.0,
+            "observed_vs_exposure_expected_jsd": distribution_jsd(observed, expected),
+            "sample_coverage_fraction": retrieved_items / max(eligible_items, 1),
+            "sample_retrieval_gini": gini(item_counts),
+            "retrievals_by_source_task": {
+                str(task): int(count) for task, count in sorted(task_counts.items())
+            },
+            "mean_query_selected_similarity": mean_or_nan(
+                event_values["query_selected_similarity"]
+            ),
+            "mean_selected_pair_similarity": mean_or_nan(
+                event_values["selected_pair_similarity"]
+            ),
+            "mean_batch_class_entropy": mean_or_nan(
+                event_values["selected_class_entropy"]
+            ),
+            "mean_unique_classes_per_replay": mean_or_nan(
+                event_values["selected_unique_classes"]
+            ),
+            "mean_score_std": mean_or_nan(event_values["score_std"]),
+            "mean_softmax_effective_fraction": mean_or_nan(
+                event_values["softmax_effective_fraction"]
+            ),
+            "raw_shallow_cosine_mean": self.raw_shallow_cosine_mean,
+            "raw_semantic_cosine_mean": self.raw_semantic_cosine_mean,
+            "transformed_shallow_cosine_mean": self.transformed_shallow_cosine_mean,
+            "transformed_semantic_cosine_mean": self.transformed_semantic_cosine_mean,
+            "gradient_cosine_mean": mean_or_nan(self.gradient_cosines),
+            "gradient_cosine_std": float(np.std(self.gradient_cosines))
+            if self.gradient_cosines
+            else float("nan"),
+            "gradient_conflict_fraction": float(
+                np.mean(np.asarray(self.gradient_cosines) < 0)
+            )
+            if self.gradient_cosines
+            else float("nan"),
+            "gradient_current_norm_mean": mean_or_nan(self.gradient_current_norms),
+            "gradient_replay_norm_mean": mean_or_nan(self.gradient_replay_norms),
+        }
+
+
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def make_worker_init(seed: int):
+    def initialize(worker_id: int):
+        worker_seed = seed + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+
+    return initialize
+
+
+def build_tasks(
+    dataset_name: str,
+    root: str,
+    classes_per_task: int,
+    download: bool,
+):
+    dataset_class = datasets.CIFAR100 if dataset_name == "cifar100" else datasets.CIFAR10
+    num_classes = 100 if dataset_name == "cifar100" else 10
+    if num_classes % classes_per_task:
+        raise ValueError("classes_per_task must divide the dataset's class count.")
+
+    train_base = dataset_class(root=root, train=True, transform=None, download=download)
+    test_base = dataset_class(root=root, train=False, transform=None, download=download)
+    mean = (0.5071, 0.4867, 0.4408) if dataset_name == "cifar100" else (0.4914, 0.4822, 0.4465)
+    std = (0.2675, 0.2565, 0.2761) if dataset_name == "cifar100" else (0.2470, 0.2435, 0.2616)
+    train_transform = transforms.Compose(
+        [
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ]
+    )
+    evaluation_transform = transforms.Compose(
+        [transforms.ToTensor(), transforms.Normalize(mean, std)]
+    )
+
+    train_targets = np.asarray(train_base.targets)
+    test_targets = np.asarray(test_base.targets)
+    train_tasks = []
+    memory_tasks = []
+    test_tasks = []
+    for start in range(0, num_classes, classes_per_task):
+        classes = np.arange(start, start + classes_per_task)
+        train_indices = np.flatnonzero(np.isin(train_targets, classes)).tolist()
+        test_indices = np.flatnonzero(np.isin(test_targets, classes)).tolist()
+        train_tasks.append(TaskDataset(train_base, train_indices, train_transform))
+        memory_tasks.append(TaskDataset(train_base, train_indices, evaluation_transform))
+        test_tasks.append(TaskDataset(test_base, test_indices, evaluation_transform))
+    return train_tasks, memory_tasks, test_tasks, num_classes
+
+
+@torch.no_grad()
+def evaluate(model, datasets_by_task, device, batch_size, workers):
+    model.eval()
+    accuracies = []
+    for dataset in datasets_by_task:
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=workers,
+            pin_memory=device.type == "cuda",
+        )
+        correct = 0
+        total = 0
+        for images, labels in loader:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            predictions = model(images).argmax(dim=1)
+            correct += int((predictions == labels).sum())
+            total += labels.numel()
+        accuracies.append(correct / max(total, 1))
+    return accuracies
+
+
+@torch.no_grad()
+def feature_quality(memory: ReplayMemory) -> Dict[str, Dict[str, float]]:
+    labels = torch.tensor(memory.labels)
+    result = {}
+    for name, features in (
+        ("shallow", memory.shallow_features),
+        ("semantic", memory.semantic_features),
+    ):
+        if features is None or len(features) < 2:
+            continue
+        normalized = F.normalize(features, dim=1)
+        classes = labels.unique(sorted=True)
+        centroids = torch.stack(
+            [F.normalize(normalized[labels == class_id].mean(0), dim=0) for class_id in classes]
+        )
+        centroid_predictions = classes[(normalized @ centroids.T).argmax(dim=1)]
+        centroid_accuracy = float((centroid_predictions == labels).float().mean())
+
+        within_values = []
+        between_values = []
+        for class_id in classes:
+            mask = labels == class_id
+            class_features = normalized[mask]
+            centroid = F.normalize(class_features.mean(0), dim=0)
+            within_values.append(float((class_features @ centroid).mean()))
+        if len(centroids) > 1:
+            matrix = centroids @ centroids.T
+            upper = torch.triu_indices(len(centroids), len(centroids), offset=1)
+            between_values = matrix[upper[0], upper[1]].tolist()
+        mean_within = float(np.mean(within_values))
+        mean_between = float(np.mean(between_values)) if between_values else 0.0
+        result[name] = {
+            "nearest_centroid_accuracy": centroid_accuracy,
+            "mean_within_class_cosine": mean_within,
+            "mean_between_class_centroid_cosine": mean_between,
+            "separation_margin": mean_within - mean_between,
+        }
+    return result
+
+
+def backward_transfer(accuracy_matrix: Sequence[Sequence[float]]) -> float:
+    if len(accuracy_matrix) <= 1:
+        return 0.0
+    final_row = accuracy_matrix[-1]
+    differences = [
+        final_row[task] - accuracy_matrix[task][task]
+        for task in range(len(accuracy_matrix) - 1)
+    ]
+    return float(np.mean(differences))
+
+
+def run_condition(args, condition: str, seed: int, device: torch.device):
+    seed_everything(seed)
+    if condition == "actr":
+        print(
+            f"  config: feature={args.actr_feature} alpha={args.actr_alpha} "
+            f"beta={args.actr_beta} gamma={args.actr_gamma} decay={args.actr_decay} "
+            f"noise={args.actr_noise} temp={args.temperature} floor={args.floor_frac} "
+            f"max_per_class={args.max_per_class}"
+        )
+    else:
+        print(
+            f"  config: temp={args.temperature} floor={args.floor_frac} "
+            f"transform={args.feature_transform} norm={args.score_normalization} "
+            f"max_per_class={args.max_per_class}"
+        )
+    train_tasks, memory_tasks, test_tasks, num_classes = build_tasks(
+        args.dataset, args.data_root, args.classes_per_task, not args.no_download
+    )
+    model = build_model(args.arch, num_classes).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    memory = ReplayMemory(
+        per_class_capacity=args.memory_per_class,
+        temperature=args.temperature,
+        floor_frac=args.floor_frac,
+        seed=seed + 10_000,
+        feature_transform=args.feature_transform,
+        score_normalization=args.score_normalization,
+        actr_feature=args.actr_feature,
+        actr_alpha=args.actr_alpha,
+        actr_beta=args.actr_beta,
+        actr_gamma=args.actr_gamma,
+        actr_decay=args.actr_decay,
+        actr_noise=args.actr_noise,
+        max_per_class=args.max_per_class,
+    )
+    accuracy_matrix = []
+    quality_by_task = {}
+    global_step = 0
+
+    for task_id, train_dataset in enumerate(train_tasks):
+        if not args.no_reset_optimizer and task_id > 0:
+            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        if len(memory) and (
+            memory.shallow_features is None
+            or task_id % max(args.refresh_every, 1) == 0
+        ):
+            memory.refresh_features(model, device)
+
+        loader_generator = torch.Generator().manual_seed(seed * 1000 + task_id)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.workers,
+            pin_memory=device.type == "cuda",
+            generator=loader_generator,
+            worker_init_fn=make_worker_init(seed * 1000 + task_id),
+        )
+        model.train()
+        for epoch in range(args.epochs):
+            running_loss = 0.0
+            running_current_loss = 0.0
+            running_replay_loss = 0.0
+            for images, labels in train_loader:
+                global_step += 1
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                current_logits = model(images)
+                current_loss = F.cross_entropy(current_logits, labels)
+                loss = current_loss
+                replay_loss_value = 0.0
+
+                if len(memory):
+                    replay_images, replay_labels = memory.select(
+                        condition=condition,
+                        query_images=images,
+                        model=model,
+                        replay_size=args.replay_batch_size,
+                        device=device,
+                        task_id=task_id,
+                        global_step=global_step,
+                    )
+                    replay_logits = model(replay_images)
+                    replay_loss = F.cross_entropy(replay_logits, replay_labels)
+                    if (
+                        args.gradient_diagnostics_every > 0
+                        and global_step % args.gradient_diagnostics_every == 0
+                    ):
+                        memory.record_gradient_diagnostics(
+                            current_loss, replay_loss, model
+                        )
+                    loss = current_loss + args.replay_weight * replay_loss
+                    replay_loss_value = float(replay_loss.detach())
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
+                running_loss += float(loss.detach())
+                running_current_loss += float(current_loss.detach())
+                running_replay_loss += replay_loss_value
+
+            batches = max(len(train_loader), 1)
+            print(
+                f"  [{condition}] task {task_id} epoch {epoch}: "
+                f"total={running_loss / batches:.4f} "
+                f"current={running_current_loss / batches:.4f} "
+                f"replay={running_replay_loss / batches:.4f}"
+            )
+
+        # The current task enters memory only after its own training. Consequently,
+        # the final task is correctly excluded from retrieval-opportunity analysis.
+        memory.add_task_data(memory_tasks[task_id], task_id, current_step=global_step)
+        memory.refresh_features(model, device)
+        quality_by_task[str(task_id)] = feature_quality(memory)
+        accuracies = evaluate(
+            model,
+            test_tasks[: task_id + 1],
+            device,
+            args.eval_batch_size,
+            args.workers,
+        )
+        accuracy_matrix.append(accuracies)
+        formatted = ", ".join(f"T{i}={value:.3f}" for i, value in enumerate(accuracies))
+        print(
+            f"[{condition}] after task {task_id}: {formatted} "
+            f"| learned_current={accuracies[task_id]:.3f}"
+        )
+
+    eligible_classes = list(range(num_classes - args.classes_per_task))
+    diagnostics = memory.diagnostics(eligible_classes)
+    diagonal = [accuracy_matrix[task][task] for task in range(len(accuracy_matrix))]
+    dead_tasks = [task for task, value in enumerate(diagonal) if value < args.plasticity_floor]
+    # BWT compares final accuracy against the diagonal. If the diagonal is ~0 the
+    # model never learned the task, so BWT trends toward 0 and looks like "less
+    # forgetting" when it actually reflects a failure to learn.
+    bwt_interpretable = len(dead_tasks) == 0
+    health = {
+        "diagonal_accuracy": diagonal,
+        "mean_diagonal_accuracy": float(np.mean(diagonal)),
+        "tasks_below_plasticity_floor": dead_tasks,
+        "plasticity_floor": args.plasticity_floor,
+        "bwt_interpretable": bwt_interpretable,
+        "optimizer_steps_per_task": int(
+            math.ceil(len(train_tasks[0]) / args.batch_size) * args.epochs
+        ),
+    }
+    result = {
+        "condition": condition,
+        "seed": seed,
+        "dataset": args.dataset,
+        "avg_accuracy": float(np.mean(accuracy_matrix[-1])),
+        "bwt": backward_transfer(accuracy_matrix),
+        "accuracy_matrix": accuracy_matrix,
+        "run_health": health,
+        "feature_quality_by_task": quality_by_task,
+        "retrieval_diagnostics": diagnostics,
+        "config": vars(args),
+    }
+    print(
+        f"[{condition} | seed {seed}] avg_acc={result['avg_accuracy']:.3f} "
+        f"BWT={result['bwt']:.3f} "
+        f"mean_diag={health['mean_diagonal_accuracy']:.3f}"
+    )
+    if not bwt_interpretable:
+        print(
+            f"[{condition}] WARNING: tasks {dead_tasks} never learned "
+            f"(accuracy < {args.plasticity_floor}). BWT is NOT interpretable for this run."
+        )
+    if not args.quiet_diagnostics:
+        print(f"[{condition}] RETRIEVAL DIAGNOSTICS")
+        print(json.dumps(diagnostics, indent=2, allow_nan=True))
+    else:
+        print(
+            f"[{condition}] coverage="
+            f"{diagnostics['sample_coverage_fraction']:.3f} "
+            f"unique_classes/batch={diagnostics['mean_unique_classes_per_replay']:.1f} "
+            f"sample_gini={diagnostics['sample_retrieval_gini']:.3f}"
+        )
+    return result, memory.events
+
+
+def paired_comparison(results: List[Dict], baseline: str = "random") -> Dict:
+    by_condition = defaultdict(dict)
+    for result in results:
+        by_condition[result["condition"]][result["seed"]] = result
+
+    if baseline not in by_condition:
+        return {
+            "status": "no_baseline",
+            "note": (
+                f"No '{baseline}' condition in this run, so no comparison is possible. "
+                "Comparing against a baseline from a different invocation is not valid "
+                "unless the seeds and settings match exactly."
+            ),
+        }
+
+    comparisons = {}
+    for condition, seed_map in by_condition.items():
+        if condition == baseline:
+            continue
+        shared = sorted(set(seed_map) & set(by_condition[baseline]))
+        if not shared:
+            continue
+        entry = {"paired_seeds": shared, "n": len(shared)}
+        for metric in ("avg_accuracy", "bwt", "mean_diagonal_accuracy"):
+            if metric == "mean_diagonal_accuracy":
+                treatment = np.asarray(
+                    [seed_map[s]["run_health"][metric] for s in shared], dtype=np.float64
+                )
+                control = np.asarray(
+                    [by_condition[baseline][s]["run_health"][metric] for s in shared],
+                    dtype=np.float64,
+                )
+            else:
+                treatment = np.asarray(
+                    [seed_map[s][metric] for s in shared], dtype=np.float64
+                )
+                control = np.asarray(
+                    [by_condition[baseline][s][metric] for s in shared], dtype=np.float64
+                )
+            differences = treatment - control
+            mean_difference = float(differences.mean())
+            # Seeds are matched (identical init and data order per seed), so a
+            # paired test is both valid and far more sensitive than comparing
+            # independent means.
+            if len(differences) > 1 and differences.std(ddof=1) > 0:
+                standard_error = differences.std(ddof=1) / math.sqrt(len(differences))
+                t_statistic = mean_difference / standard_error
+                cohens_d = mean_difference / differences.std(ddof=1)
+            else:
+                t_statistic = float("nan")
+                cohens_d = float("nan")
+            entry[metric] = {
+                f"{baseline}_mean": float(control.mean()),
+                f"{condition}_mean": float(treatment.mean()),
+                "mean_difference": mean_difference,
+                "per_seed_differences": [round(float(d), 4) for d in differences],
+                "seeds_favoring_treatment": int((differences > 0).sum()),
+                "paired_t": float(t_statistic),
+                "cohens_d": float(cohens_d),
+                "significant_at_05": bool(
+                    np.isfinite(t_statistic)
+                    and abs(t_statistic) > t_critical(len(differences) - 1)
+                ),
+            }
+        comparisons[condition] = entry
+
+    for condition, entry in comparisons.items():
+        bwt_gain = entry["bwt"]["mean_difference"]
+        diagonal_drop = -entry["mean_diagonal_accuracy"]["mean_difference"]
+        # BWT is measured against the diagonal, so learning less mechanically
+        # inflates it. If the diagonal fell by as much as BWT rose, the apparent
+        # "less forgetting" is really reduced plasticity.
+        confounded = bwt_gain > 0 and diagonal_drop > 0.5 * bwt_gain
+        entry["plasticity_confound"] = {
+            "bwt_gain": bwt_gain,
+            "diagonal_drop": diagonal_drop,
+            "bwt_gain_explained_by_diagonal_drop": confounded,
+            "note": (
+                "BWT improvement is likely an artifact of learning less, not of "
+                "forgetting less. Report mean_diagonal_accuracy alongside BWT."
+                if confounded
+                else "BWT gain is not explained by a drop in plasticity."
+            ),
+        }
+
+    return {"status": "compared", "baseline": baseline, "comparisons": comparisons}
+
+
+# Two-tailed t critical values at alpha=0.05, indexed by degrees of freedom.
+TWO_TAILED_T_CRITICAL = {
+    1: 12.706,
+    2: 4.303,
+    3: 3.182,
+    4: 2.776,
+    5: 2.571,
+    6: 2.447,
+    7: 2.365,
+    8: 2.306,
+    9: 2.262,
+    10: 2.228,
+    14: 2.145,
+    19: 2.093,
+}
+
+
+def t_critical(degrees_of_freedom: int) -> float:
+    if degrees_of_freedom < 1:
+        return float("inf")
+    # Fall back to the nearest tabulated df at or below the requested one, which
+    # keeps the threshold conservative rather than anti-conservative.
+    available = [df for df in TWO_TAILED_T_CRITICAL if df <= degrees_of_freedom]
+    if not available:
+        return float("inf")
+    return TWO_TAILED_T_CRITICAL[max(available)]
+
+
+def write_outputs(output_dir: Path, results: List[Dict], all_events: List[Dict]):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "results.json").open("w", encoding="utf-8") as handle:
+        json.dump(results, handle, indent=2, allow_nan=True)
+
+    if all_events:
+        with (output_dir / "replay_events.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(all_events[0]))
+            writer.writeheader()
+            writer.writerows(all_events)
+
+    summary = []
+    for condition in sorted({result["condition"] for result in results}):
+        condition_results = [
+            result for result in results if result["condition"] == condition
+        ]
+        accuracy = np.asarray([result["avg_accuracy"] for result in condition_results])
+        bwt = np.asarray([result["bwt"] for result in condition_results])
+        diagnostic_keys = (
+            "retrieval_count_cv",
+            "retrieval_count_gini",
+            "exposure_normalized_ratio_cv",
+            "observed_vs_exposure_expected_jsd",
+            "sample_coverage_fraction",
+            "sample_retrieval_gini",
+            "mean_selected_pair_similarity",
+            "mean_batch_class_entropy",
+            "mean_unique_classes_per_replay",
+            "mean_score_std",
+            "mean_softmax_effective_fraction",
+            "gradient_cosine_mean",
+            "gradient_conflict_fraction",
+        )
+        row = {
+            "condition": condition,
+            "seeds": len(condition_results),
+            "avg_accuracy_mean": float(accuracy.mean()),
+            "avg_accuracy_std": float(accuracy.std()),
+            "bwt_mean": float(bwt.mean()),
+            "bwt_std": float(bwt.std()),
+            "mean_diagonal_accuracy": float(
+                np.mean(
+                    [
+                        result["run_health"]["mean_diagonal_accuracy"]
+                        for result in condition_results
+                    ]
+                )
+            ),
+            "runs_with_interpretable_bwt": int(
+                sum(
+                    1
+                    for result in condition_results
+                    if result["run_health"]["bwt_interpretable"]
+                )
+            ),
+        }
+        for key in diagnostic_keys:
+            values = np.asarray(
+                [
+                    result["retrieval_diagnostics"][key]
+                    for result in condition_results
+                ],
+                dtype=np.float64,
+            )
+            # Random replay computes no similarity scores, so score-based metrics
+            # are legitimately all-NaN for that condition.
+            if values.size == 0 or np.all(np.isnan(values)):
+                row[f"{key}_mean"] = float("nan")
+                row[f"{key}_std"] = float("nan")
+            else:
+                row[f"{key}_mean"] = float(np.nanmean(values))
+                row[f"{key}_std"] = float(np.nanstd(values))
+        summary.append(row)
+
+    with (output_dir / "summary.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(summary[0]))
+        writer.writeheader()
+        writer.writerows(summary)
+
+    summary_by_condition = {row["condition"]: row for row in summary}
+
+    print("\n===== Summary (mean +/- std over seeds) =====")
+    for row in summary:
+        flag = "" if row["runs_with_interpretable_bwt"] == row["seeds"] else "  [BWT UNRELIABLE]"
+        print(
+            f"{row['condition']:10s} "
+            f"avg_acc={row['avg_accuracy_mean']:.3f} +/- {row['avg_accuracy_std']:.3f}  "
+            f"BWT={row['bwt_mean']:.3f} +/- {row['bwt_std']:.3f}  "
+            f"mean_diag={row['mean_diagonal_accuracy']:.3f}  "
+            f"exposure-JSD={row['observed_vs_exposure_expected_jsd_mean']:.4f}  "
+            f"sample-coverage={row['sample_coverage_fraction_mean']:.3f}  "
+            f"grad-conflict={row['gradient_conflict_fraction_mean']:.3f}{flag}"
+        )
+
+    diagnosis = {
+        "status": "insufficient_conditions",
+        "interpretation": [
+            "Run both random and shallow conditions to generate a direct diagnosis."
+        ],
+    }
+    if "random" in summary_by_condition and "shallow" in summary_by_condition:
+        random_row = summary_by_condition["random"]
+        shallow_row = summary_by_condition["shallow"]
+        findings = []
+
+        degenerate = [
+            row["condition"]
+            for row in summary
+            if row["runs_with_interpretable_bwt"] < row["seeds"]
+        ]
+        if degenerate:
+            diagnosis = {
+                "status": "invalid_run",
+                "degenerate_conditions": degenerate,
+                "interpretation": [
+                    "One or more conditions failed to learn some tasks, so their "
+                    "diagonal accuracy is ~0 and BWT is driven by lack of plasticity "
+                    "rather than by forgetting.",
+                    "Fix plasticity first (smaller --batch-size, more --epochs, or a "
+                    "lower --replay-weight), then compare retrieval conditions.",
+                ],
+            }
+            with (output_dir / "diagnosis.json").open("w", encoding="utf-8") as handle:
+                json.dump(diagnosis, handle, indent=2, allow_nan=True)
+            print("\n===== Diagnosis =====")
+            print(json.dumps(diagnosis, indent=2))
+            return
+
+        random_jsd = random_row["observed_vs_exposure_expected_jsd_mean"]
+        shallow_jsd = shallow_row["observed_vs_exposure_expected_jsd_mean"]
+        random_coverage = random_row["sample_coverage_fraction_mean"]
+        shallow_coverage = shallow_row["sample_coverage_fraction_mean"]
+        if shallow_jsd > random_jsd * 1.25 and shallow_coverage < random_coverage - 0.05:
+            findings.append(
+                {
+                    "mechanism": "coverage_bias",
+                    "supported": True,
+                    "reason": (
+                        "Shallow retrieval departs more from its exposure-adjusted "
+                        "uniform baseline and reaches fewer stored samples than random."
+                    ),
+                }
+            )
+        else:
+            findings.append(
+                {
+                    "mechanism": "coverage_bias",
+                    "supported": False,
+                    "reason": (
+                        "Shallow retrieval does not show both a materially larger "
+                        "exposure-adjusted divergence and lower sample coverage."
+                    ),
+                }
+            )
+
+        random_pair = random_row["mean_selected_pair_similarity_mean"]
+        shallow_pair = shallow_row["mean_selected_pair_similarity_mean"]
+        findings.append(
+            {
+                "mechanism": "redundant_similarity_replay",
+                "supported": bool(
+                    np.isfinite(random_pair)
+                    and np.isfinite(shallow_pair)
+                    and shallow_pair > random_pair + 0.05
+                ),
+                "reason": (
+                    "Selected shallow batches are more internally similar than random."
+                    if np.isfinite(random_pair)
+                    and np.isfinite(shallow_pair)
+                    and shallow_pair > random_pair + 0.05
+                    else "Shallow batches are not materially more redundant than random."
+                ),
+            }
+        )
+
+        random_conflict = random_row["gradient_conflict_fraction_mean"]
+        shallow_conflict = shallow_row["gradient_conflict_fraction_mean"]
+        findings.append(
+            {
+                "mechanism": "gradient_interference",
+                "supported": bool(
+                    np.isfinite(random_conflict)
+                    and np.isfinite(shallow_conflict)
+                    and shallow_conflict > random_conflict + 0.05
+                ),
+                "reason": (
+                    "Shallow replay gradients conflict with current-task gradients more "
+                    "often than random replay gradients."
+                    if np.isfinite(random_conflict)
+                    and np.isfinite(shallow_conflict)
+                    and shallow_conflict > random_conflict + 0.05
+                    else "Shallow replay does not show materially more gradient conflict."
+                ),
+            }
+        )
+        shallow_effective = shallow_row["mean_softmax_effective_fraction_mean"]
+        semantic_effective = summary_by_condition.get("semantic", {}).get(
+            "mean_softmax_effective_fraction_mean", float("nan")
+        )
+        findings.append(
+            {
+                "mechanism": "non_selective_retrieval",
+                "supported": bool(
+                    np.isfinite(shallow_effective) and shallow_effective > 0.5
+                ),
+                "shallow_softmax_effective_fraction": shallow_effective,
+                "semantic_softmax_effective_fraction": semantic_effective,
+                "reason": (
+                    "The shallow retrieval distribution stays close to uniform, so "
+                    "'shallow' is effectively random replay with extra compute."
+                    if np.isfinite(shallow_effective) and shallow_effective > 0.5
+                    else "Shallow retrieval is meaningfully peaked, so it is genuinely selective."
+                ),
+            }
+        )
+        diagnosis = {
+            "status": "diagnosed",
+            "thresholds": {
+                "coverage_jsd_multiplier": 1.25,
+                "sample_coverage_absolute_gap": 0.05,
+                "pair_similarity_absolute_gap": 0.05,
+                "gradient_conflict_absolute_gap": 0.05,
+            },
+            "findings": findings,
+            "important_note": (
+                "Raw class retrieval totals are age-confounded. Prefer the "
+                "exposure-normalized JSD and observed/expected ratios when deciding "
+                "whether similarity replay is biased."
+            ),
+        }
+
+        if "actr" in summary_by_condition:
+            actr_row = summary_by_condition["actr"]
+            diagnosis["actr_intervention"] = {
+                "coverage_recovered": bool(
+                    actr_row["sample_coverage_fraction_mean"]
+                    > shallow_row["sample_coverage_fraction_mean"] + 0.05
+                ),
+                "beats_shallow_on_bwt": bool(
+                    actr_row["bwt_mean"] > shallow_row["bwt_mean"]
+                ),
+                "beats_random_on_bwt": bool(
+                    actr_row["bwt_mean"] > random_row["bwt_mean"]
+                ),
+                "beats_random_on_accuracy": bool(
+                    actr_row["avg_accuracy_mean"] > random_row["avg_accuracy_mean"]
+                ),
+                "sample_coverage": {
+                    "random": random_row["sample_coverage_fraction_mean"],
+                    "shallow": shallow_row["sample_coverage_fraction_mean"],
+                    "actr": actr_row["sample_coverage_fraction_mean"],
+                },
+                "bwt": {
+                    "random": random_row["bwt_mean"],
+                    "shallow": shallow_row["bwt_mean"],
+                    "actr": actr_row["bwt_mean"],
+                },
+                "note": (
+                    "Recovering coverage without beating random means coverage was "
+                    "necessary but not sufficient, which is itself a reportable result."
+                ),
+            }
+    with (output_dir / "diagnosis.json").open("w", encoding="utf-8") as handle:
+        json.dump(diagnosis, handle, indent=2, allow_nan=True)
+
+    comparison = paired_comparison(results)
+    with (output_dir / "paired_comparison.json").open("w", encoding="utf-8") as handle:
+        json.dump(comparison, handle, indent=2, allow_nan=True)
+
+    print("\n===== Paired comparison vs random (same seeds) =====")
+    if comparison["status"] != "compared":
+        print(comparison["note"])
+    else:
+        for condition, entry in comparison["comparisons"].items():
+            for metric in ("avg_accuracy", "bwt", "mean_diagonal_accuracy"):
+                stats = entry[metric]
+                verdict = (
+                    "SIGNIFICANT" if stats["significant_at_05"] else "not significant"
+                )
+                print(
+                    f"{condition} vs random | {metric}: "
+                    f"{stats['mean_difference']:+.4f} "
+                    f"(n={entry['n']}, {stats['seeds_favoring_treatment']}/{entry['n']} seeds favor, "
+                    f"t={stats['paired_t']:.2f}, d={stats['cohens_d']:.2f}) -> {verdict}"
+                )
+            if entry["plasticity_confound"]["bwt_gain_explained_by_diagonal_drop"]:
+                print(
+                    f"  WARNING [{condition}]: BWT gain "
+                    f"({entry['plasticity_confound']['bwt_gain']:+.4f}) co-occurs with a "
+                    f"diagonal drop ({entry['plasticity_confound']['diagonal_drop']:+.4f}). "
+                    "This is reduced plasticity, not reduced forgetting."
+                )
+
+    print("\n===== Diagnosis =====")
+    print(json.dumps(diagnosis, indent=2, allow_nan=True))
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--condition",
+        choices=("random", "semantic", "shallow", "actr", "all", "compare"),
+        default="all",
+    )
+    parser.add_argument("--dataset", choices=("cifar10", "cifar100"), default="cifar100")
+    parser.add_argument(
+        "--arch", choices=("small_cnn", "resnet18"), default="small_cnn"
+    )
+    parser.add_argument("--data-root", default="/kaggle/working/data")
+    parser.add_argument("--output-dir", default="/kaggle/working/actr_diagnostics")
+    parser.add_argument("--seeds", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--classes-per-task", type=int, default=10)
+    parser.add_argument("--memory-per-class", type=int, default=40)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--eval-batch-size", type=int, default=256)
+    parser.add_argument("--replay-batch-size", type=int, default=32)
+    parser.add_argument("--replay-weight", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument("--floor-frac", type=float, default=0.0)
+    parser.add_argument("--refresh-every", type=int, default=1)
+    parser.add_argument("--gradient-diagnostics-every", type=int, default=25)
+    parser.add_argument(
+        "--feature-transform",
+        choices=("none", "center", "standardize"),
+        default="standardize",
+    )
+    parser.add_argument(
+        "--score-normalization", choices=("none", "zscore"), default="zscore"
+    )
+    parser.add_argument("--plasticity-floor", type=float, default=0.05)
+    parser.add_argument(
+        "--actr-feature", choices=("shallow", "semantic"), default="shallow"
+    )
+    parser.add_argument("--actr-alpha", type=float, default=1.0)
+    parser.add_argument("--actr-beta", type=float, default=-1.0)
+    parser.add_argument("--actr-gamma", type=float, default=1.0)
+    parser.add_argument("--actr-decay", type=float, default=0.5)
+    parser.add_argument("--actr-noise", type=float, default=0.0)
+    parser.add_argument(
+        "--max-per-class",
+        type=int,
+        default=0,
+        help="Cap items per class within a replay batch (0 disables the cap).",
+    )
+    parser.add_argument("--grad-clip", type=float, default=5.0)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--no-reset-optimizer", action="store_true")
+    parser.add_argument(
+        "--quiet-diagnostics",
+        action="store_true",
+        help="Print a one-line retrieval summary instead of the full JSON dump.",
+    )
+    parser.add_argument("--no-download", action="store_true")
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print(f"Ignoring notebook arguments: {unknown}")
+    if not 0.0 <= args.floor_frac <= 1.0:
+        parser.error("--floor-frac must be between 0 and 1.")
+    if not 0.0 < args.actr_decay < 1.0:
+        parser.error("--actr-decay must be strictly between 0 and 1.")
+    if args.max_per_class < 0:
+        parser.error("--max-per-class must be 0 (disabled) or positive.")
+    if args.seeds < 1 or args.epochs < 1:
+        parser.error("--seeds and --epochs must be positive.")
+    return args
+
+
+def main():
+    args = parse_arguments()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    if args.condition == "all":
+        conditions = ["random", "semantic", "shallow"]
+    elif args.condition == "compare":
+        conditions = ["random", "shallow", "actr"]
+    else:
+        conditions = [args.condition]
+    results = []
+    all_events = []
+    for condition in conditions:
+        for seed in range(args.seeds):
+            print(f"\n===== Running condition: {condition} | seed {seed} =====")
+            result, events = run_condition(args, condition, seed, device)
+            results.append(result)
+            all_events.extend(
+                {
+                    "condition": condition,
+                    "seed": seed,
+                    **asdict(event),
+                }
+                for event in events
+            )
+    write_outputs(Path(args.output_dir), results, all_events)
+
+
+if __name__ == "__main__":
+    main()
